@@ -353,8 +353,9 @@ fn daemon(daemon: Daemon) -> ! {
 
     mark(&led, 6, "/var/lib/ai/net-06", "sobreviveu ao GENET — beacon-only M1");
 
-    // Ready before any scheme/TX: etapa 7+ hung the board when NetworkScheme
-    // was registered first. M1 = beacons only; M2 scheme later.
+    // Ready before any scheme/TX. NetworkScheme::new hung the board again on
+    // 2026-11-04 (M2). Keep beacon-only unless feature `network-scheme` is on
+    // AND scripts/pi4-regression-guard.sh + HW login/beacon pass.
     let _ = daemon.ready();
     mark(&led, 7, "/var/lib/ai/net-07", "daemon.ready — a transmitir AIOS-BOOT");
 
