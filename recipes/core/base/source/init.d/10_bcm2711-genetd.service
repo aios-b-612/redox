@@ -5,9 +5,7 @@ requires_weak = [
 ]
 
 [service]
-# init PATH is only $prefix/bin — the binary lives under /usr/lib/drivers
-# (same layout as pcid-spawner). Absolute path required or the unit never starts.
+# Absolute path — init PATH is only $prefix/bin.
 cmd = "/usr/lib/drivers/bcm2711-genetd"
-# notify: init espera daemon.ready() (após network.genet), para o netstack
-# não expirar o retry de 10s à procura de /scheme/network*.
-type = "notify"
+# oneshot_async: do not block boot if MDIO/init is slow (notify waited on ready).
+type = "oneshot_async"
