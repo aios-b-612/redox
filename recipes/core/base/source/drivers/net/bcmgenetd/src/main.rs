@@ -351,50 +351,62 @@ fn daemon(daemon: Daemon) -> ! {
         }
     }
 
-    mark(&led, 6, "/var/lib/ai/net-06", "sobreviveu ao GENET — beacon-only M1");
+    mark(
+        &led,
+        6,
+        "/var/lib/ai/net-06",
+        "sobreviveu ao GENET — registrando network.genet (M2)",
+    );
 
-    // Ready before any scheme/TX: etapa 7+ hung the board when NetworkScheme
-    // was registered first. M1 = beacons only; M2 scheme later.
-    let _ = daemon.ready();
-    mark(&led, 7, "/var/lib/ai/net-07", "daemon.ready — a transmitir AIOS-BOOT");
+    // NetworkScheme::new regista o scheme e chama daemon.ready() (notify).
+    // M1 hung aqui por stall TX (DMA_RING_CFG); com RING_CFG correcto o
+    // netstack/dhcpd podem falar com network.genet.
+    let adapter = GenetAdapter { genet };
+    let mut scheme = NetworkScheme::new(
+        move || adapter,
+        daemon,
+        "network.genet".to_string(),
+    );
+    mark(&led, 7, "/var/lib/ai/net-07", "network.genet registered");
 
-    let mut genet = genet;
+    // Sem IRQ GENET mapeado ainda: poll curto + tick (RX/TX via scheme).
+    // Beacon AIOS-BOOT mantém-se como diagnóstico L2 no cabo.
     let mut counter: u64 = 0;
+    let mut last_beacon = std::time::Instant::now();
+    let _ = scheme.tick();
     loop {
-        println!("AIOS genet: loop n={counter} pre-phy");
-        let linked = genet.poll_phy_and_adjust();
-        let speed = genet.max_speed();
-        println!("AIOS genet: phy link={} speed={}", linked as u8, speed);
-        if !linked || counter % 10 == 0 {
-            let diag = genet.mdio_diag();
-            println!("AIOS genet: {diag}");
-            if counter % 10 == 0 {
-                breadcrumb::write(4, &diag, None);
+        let _ = scheme.tick();
+
+        if last_beacon.elapsed() >= Duration::from_secs(2) {
+            last_beacon = std::time::Instant::now();
+            let linked = scheme.adapter_mut().genet.poll_phy_and_adjust();
+            let speed = scheme.adapter().genet.max_speed();
+            counter += 1;
+            println!(
+                "AIOS genet: M2 n={counter} link={} speed={}",
+                linked as u8, speed
+            );
+            if !linked || counter % 10 == 0 {
+                let diag = scheme.adapter().genet.mdio_diag();
+                println!("AIOS genet: {diag}");
+                if counter % 10 == 0 {
+                    breadcrumb::write(4, &diag, None);
+                }
+            }
+            let msg = format!(
+                "AIOS-BOOT n={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} speed={} link={}",
+                counter, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], speed, linked as u8
+            );
+            match scheme.adapter_mut().genet.tx_beacon(counter, &msg) {
+                Ok(()) => println!("AIOS genet: beacon {counter} ok"),
+                Err(e) => println!("AIOS genet: beacon {counter} err: {e}"),
+            }
+            if let Some(l) = &led {
+                l.success();
             }
         }
 
-        counter += 1;
-        let msg = format!(
-            "AIOS-BOOT n={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} speed={} link={}",
-            counter, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], speed, linked as u8
-        );
-        match genet.tx_beacon(counter, &msg) {
-            Ok(()) => println!("AIOS genet: beacon {counter} ok"),
-            Err(e) => println!("AIOS genet: beacon {counter} err: {e}"),
-        }
-        genet.poll_rx();
-
-        if counter % 10 == 0 {
-            breadcrumb::write(
-                4,
-                &format!("beacon-only speed={speed} link={}", linked as u8),
-                None,
-            );
-        }
-        if let Some(l) = &led {
-            l.success();
-        }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
