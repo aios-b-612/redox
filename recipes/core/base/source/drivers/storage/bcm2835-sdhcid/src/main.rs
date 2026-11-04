@@ -1,11 +1,34 @@
 use std::process;
+use std::sync::{Arc, Mutex};
 
 use driver_block::{Disk, DiskScheme, ExecutorTrait, TrivialExecutor};
 use event::{EventFlags, RawEventQueue};
 use fdt::Fdt;
 
+mod logdump;
 mod sd;
 mod sdhci;
+
+/// AIOS: share the EMMC2 controller between the disk scheme and the early log
+/// dumper thread, so both serialise on the same mutex.
+struct SharedCtrl(Arc<Mutex<sdhci::SdhciCtrl>>);
+
+impl Disk for SharedCtrl {
+    fn block_size(&self) -> u32 {
+        self.0.lock().unwrap().block_size()
+    }
+    fn size(&self) -> u64 {
+        self.0.lock().unwrap().size()
+    }
+    async fn read(&mut self, block: u64, buffer: &mut [u8]) -> syscall::Result<usize> {
+        let mut c = self.0.lock().unwrap();
+        unsafe { c.read_blocks(block, buffer) }
+    }
+    async fn write(&mut self, block: u64, buffer: &[u8]) -> syscall::Result<usize> {
+        let mut c = self.0.lock().unwrap();
+        unsafe { c.write_blocks(block, buffer) }
+    }
+}
 
 #[cfg(target_os = "redox")]
 fn get_dtb() -> Vec<u8> {
@@ -45,7 +68,9 @@ fn run_scheme<D: Disk + 'static>(daemon: daemon::Daemon, disk: D) -> ! {
         .subscribe(scheme.event_handle().raw(), 0, EventFlags::READ)
         .expect("mmcd: failed to event disk scheme");
 
-    libredox::call::setrens(0, 0).expect("mmcd: failed to enter null namespace");
+    // AIOS: keep the initfs namespace so the log dumper thread can keep
+    // opening /scheme/sys/log after the driver is serving the disk.
+    // libredox::call::setrens(0, 0).expect("mmcd: failed to enter null namespace");
 
     for event in event_queue {
         let event = event.unwrap();
@@ -129,7 +154,15 @@ fn daemon(daemon: daemon::Daemon) -> ! {
                 .init()
                 .expect("emmc2: failed to initialize the SD card");
         }
-        run_scheme(daemon, controller);
+        let shared = Arc::new(Mutex::new(controller));
+        // Logdump races with redoxfs switchroot on Pi 4 HW (Lacks grant /
+        // Partition(0,2) drop → total ENOENT). Disabled until DiskScheme is
+        // exclusive; recover logs via serial or a post-login oneshot later.
+        println!(
+            "AIOS: logdump DISABLED (was LBA {}) — avoids redoxfs abort",
+            logdump::LOG_LBA
+        );
+        run_scheme(daemon, SharedCtrl(shared));
     } else {
         let mut controller = sd::SdHostCtrl::new(addr);
         unsafe {

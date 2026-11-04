@@ -400,9 +400,29 @@ impl SdhciCtrl {
         read: bool,
         buffer: &mut [u8],
     ) -> Result<()> {
-        let result = self.transfer_blocks_inner(index, lba, blocks, read, buffer);
+        let mut result = self.transfer_blocks_inner(index, lba, blocks, read, buffer);
         if result.is_err() {
+            // AIOS: one retry after resetting the lines. A slow card can miss a
+            // single transfer (internal garbage collection) and then work fine;
+            // failing the whole request would abort a filesystem mount.
             self.reset_lines();
+            println!(
+                "emmc2: retrying {} {} block(s) at lba {}",
+                if read { "read" } else { "write" },
+                blocks,
+                lba
+            );
+            wait_msec(10);
+            result = self.transfer_blocks_inner(index, lba, blocks, read, buffer);
+            if result.is_err() {
+                self.reset_lines();
+                println!(
+                    "emmc2: {} of {} block(s) at lba {} failed twice",
+                    if read { "read" } else { "write" },
+                    blocks,
+                    lba
+                );
+            }
         }
         result
     }
@@ -456,20 +476,23 @@ impl SdhciCtrl {
 
         self.issue_command()?;
 
-        // Move the data block by block through the buffer data port. The
-        // controller tells us when a block is ready using the present state
-        // register (same approach as Linux `sdhci_transfer_pio`).
-        let state_bit = if read {
-            PRESENT_DATA_AVAILABLE
+        // Move the data block by block through the buffer data port.
+        //
+        // AIOS: wait for "Buffer Read/Write Ready" once per block, which the
+        // controller only raises when a WHOLE block fits in its internal
+        // buffer. The present-state bits (Data/Space Available) only mean that
+        // a few bytes are in the buffer: reading 512 bytes after seeing them
+        // returns whatever the buffer happens to hold, which corrupted data
+        // silently on real hardware (QEMU is instantaneous, so it never
+        // showed there).
+        let buffer_ready_bit = if read {
+            INT_BUF_READ_READY
         } else {
-            PRESENT_SPACE_AVAILABLE
+            INT_BUF_WRITE_READY
         };
 
         for block in 0..blocks as usize {
-            if !self.wait_bits(SDHCI_PRESENT_STATE, state_bit, state_bit, 2000) {
-                println!("emmc2: timeout waiting for data buffer (block {})", block);
-                return Err(Error::new(EINVAL));
-            }
+            self.wait_interrupt(buffer_ready_bit, 5000)?;
             self.check_error()?;
 
             let offset = block * SD_BLOCK_SIZE as usize;
@@ -487,7 +510,9 @@ impl SdhciCtrl {
             }
         }
 
-        self.wait_interrupt(INT_XFER_COMPLETE, 2000)?;
+        // Slow cards (internal garbage collection) can take a while to
+        // complete a transfer.
+        self.wait_interrupt(INT_XFER_COMPLETE, 5000)?;
 
         // Let a possible auto CMD12 finish before the next command
         self.wait_idle()?;
