@@ -71,6 +71,7 @@ const DMA_DESC_SIZE: usize = 12;
 
 const TOTAL_DESCS: usize = 256;
 const RX_BUF_LENGTH: usize = 2048;
+const TX_BUF_LENGTH: usize = 2048;
 const RX_TOTAL_BUFSIZE: usize = RX_BUF_LENGTH * TOTAL_DESCS;
 const DEFAULT_Q: usize = 0x10;
 const DMA_RING_SIZE: usize = 0x40;
@@ -165,24 +166,30 @@ impl Genet {
         })
     }
 
-    pub fn init(&mut self, led: &crate::led::Led) -> Result<(), &'static str> {
+    pub fn init(&mut self, led: Option<&crate::led::Led>) -> Result<(), &'static str> {
         let base = self.base;
         // stage 1: rev check
         crate::breadcrumb::write(1, "init: reading SYS_REV_CTRL", None);
-        led.stage(1);
+        if let Some(l) = led {
+            l.stage(1);
+        }
         let rev = rd32(base, SYS_REV_CTRL);
         let major = (rev >> 24) & 0x0F;
         let minor = (rev >> 16) & 0x0F;
         crate::breadcrumb::write(1, &format!("rev major={} minor={}", major, minor), None);
         if major != 6 {
             crate::breadcrumb::write(1, "unsupported GENET major", Some("major != 6"));
-            led.error();
+            if let Some(l) = led {
+                l.error();
+            }
             return Err("unsupported GENET major");
         }
 
         // stage 2: interface set
         crate::breadcrumb::write(2, "interface set (PORT_MODE_EXT_GPHY)", None);
-        led.stage(2);
+        if let Some(l) = led {
+            l.stage(2);
+        }
         wr32(base, SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
 
         // umac reset
@@ -201,18 +208,31 @@ impl Genet {
         self.rx_descs_init();
         self.tx_ring_init();
         crate::breadcrumb::write(3, "rings initialized", None);
-        led.stage(3);
+        if let Some(l) = led { l.stage(3); }
 
         // enable dma
         self.enable_dma();
-        crate::breadcrumb::write(3, "dma enabled", None);
+        let ring_cfg = rd32(base, TDMA_CTRL_BASE + DMA_RING_CFG);
+        let dma_ctrl = rd32(base, TDMA_CTRL_BASE + DMA_CTRL);
+        crate::breadcrumb::write(
+            3,
+            &format!(
+                "dma enabled TDMA RING_CFG={:08x} CTRL={:08x} (expect bit16 cfg, bit17+EN ctrl)",
+                ring_cfg, dma_ctrl
+            ),
+            None,
+        );
+        println!(
+            "AIOS genet: TDMA RING_CFG={:08x} CTRL={:08x}",
+            ring_cfg, dma_ctrl
+        );
 
         // phy init
         crate::breadcrumb::write(4, "phy init starting", None);
-        led.stage(4);
+        if let Some(l) = led { l.stage(4); }
         if let Err(e) = self.phy_init() {
             crate::breadcrumb::write(4, "phy init failed", Some(e));
-            led.error();
+            if let Some(l) = led { l.error(); }
             return Err(e);
         }
         crate::breadcrumb::write(4, &format!("phy link up, speed={}", self.max_speed), None);
@@ -220,18 +240,35 @@ impl Genet {
         // adjust link
         self.adjust_link();
         crate::breadcrumb::write(5, &format!("adjust_link speed={}", self.max_speed), None);
-        led.stage(5);
+        if let Some(l) = led { l.stage(5); }
 
         // enable mac tx/rx
         let cmd = rd32(base, UMAC_CMD);
         wr32(base, UMAC_CMD, cmd | CMD_TX_EN | CMD_RX_EN);
         crate::breadcrumb::write(5, "mac tx/rx enabled", None);
 
-        // oob
-        let v = rd32(base, EXT_RGMII_OOB_CTRL);
-        wr32(base, EXT_RGMII_OOB_CTRL, (v & !OOB_DISABLE) | RGMII_LINK | RGMII_MODE_EN | ID_MODE_DIS);
+        // oob — U-Boot: RGMII_LINK|MODE_EN, ID_MODE_DIS for rgmii and rgmii-rxid (Pi4).
+        self.apply_rgmii_oob(true);
 
         Ok(())
+    }
+
+    /// EXT_RGMII_OOB_CTRL: clear OOB_DISABLE, set MODE_EN; ID_MODE_DIS for Pi4 phy-modes.
+    fn apply_rgmii_oob(&self, link: bool) {
+        let base = self.base;
+        let mut v = rd32(base, EXT_RGMII_OOB_CTRL);
+        v &= !OOB_DISABLE;
+        v |= RGMII_MODE_EN;
+        if link {
+            v |= RGMII_LINK;
+        } else {
+            v &= !RGMII_LINK;
+        }
+        // Pi4 is rgmii-rxid; U-Boot also sets ID_MODE_DIS for plain rgmii.
+        // self.rxid is true for rgmii-rxid; always set on this board path.
+        v |= ID_MODE_DIS;
+        let _ = self.rxid; // retained for future phy-mode variants
+        wr32(base, EXT_RGMII_OOB_CTRL, v);
     }
 
     fn umac_reset(&self) {
@@ -293,7 +330,8 @@ impl Genet {
         self.rx_index = self.c_index & 0xFF;
         wr32(base, RDMA_RING_BASE + DMA_RING_BUF_SIZE, ((TOTAL_DESCS << 16) | RX_BUF_LENGTH) as u32);
         wr32(base, RDMA_RING_BASE + RDMA_XON_XOFF_THRESH, DMA_FC_THRESH_VALUE);
-        wr32(base, RDMA_CTRL_BASE + DMA_RING_CFG, 1 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT));
+        // DMA_RING_CFG uses bit q; DMA_CTRL uses bit (q + DMA_RING_BUF_EN_SHIFT). U-Boot bcmgenet.
+        wr32(base, RDMA_CTRL_BASE + DMA_RING_CFG, 1 << (DEFAULT_Q as u32));
     }
 
     fn rx_descs_init(&self) {
@@ -312,6 +350,7 @@ impl Genet {
     fn tx_ring_init(&mut self) {
         let base = self.base;
         wr32(base, TDMA_CTRL_BASE + DMA_SCB_BURST_SIZE, DMA_MAX_BURST_LENGTH);
+        wr32(base, TDMA_RING_BASE + DMA_START_ADDR, 0);
         wr32(base, TDMA_RING_BASE + DMA_READ_PTR, 0);
         wr32(base, TDMA_RING_BASE + DMA_WRITE_PTR, 0);
         wr32(base, TDMA_RING_BASE + DMA_END_ADDR, (TOTAL_DESCS * DMA_DESC_SIZE / 4 - 1) as u32);
@@ -322,7 +361,8 @@ impl Genet {
         wr32(base, TDMA_RING_BASE + DMA_MBUF_DONE_THRESH, 1);
         wr32(base, TDMA_RING_BASE + DMA_FLOW_PERIOD, 0);
         wr32(base, TDMA_RING_BASE + DMA_RING_BUF_SIZE, ((TOTAL_DESCS << 16) | RX_BUF_LENGTH) as u32);
-        wr32(base, TDMA_CTRL_BASE + DMA_RING_CFG, 1 << (DEFAULT_Q as u32 + DMA_RING_BUF_EN_SHIFT));
+        // DMA_RING_CFG bit = DEFAULT_Q (16), not 16+SHIFT — was enabling wrong ring → TX stall.
+        wr32(base, TDMA_CTRL_BASE + DMA_RING_CFG, 1 << (DEFAULT_Q as u32));
     }
 
     fn enable_dma(&self) {
@@ -335,10 +375,7 @@ impl Genet {
 
     fn adjust_link(&self) {
         let base = self.base;
-        let v = rd32(base, EXT_RGMII_OOB_CTRL);
-        wr32(base, EXT_RGMII_OOB_CTRL, (v & !OOB_DISABLE) | RGMII_LINK | RGMII_MODE_EN);
-        let v = rd32(base, EXT_RGMII_OOB_CTRL);
-        wr32(base, EXT_RGMII_OOB_CTRL, v | ID_MODE_DIS);
+        self.apply_rgmii_oob(true);
         let sp = match self.max_speed {
             1000 => UMAC_SPEED_1000,
             100 => UMAC_SPEED_100,
@@ -349,18 +386,89 @@ impl Genet {
         wr32(base, UMAC_CMD, (cmd & !((CMD_SPEED_MASK) << CMD_SPEED_SHIFT)) | (sp << CMD_SPEED_SHIFT));
     }
 
-    fn phy_init(&mut self) -> Result<(), &'static str> {
+    /// Dump MDIO: PHYID/BMCR/BMSR at configured addr + scan 0..31 for non-zero IDs.
+    pub fn mdio_diag(&self) -> String {
         let base = self.base;
         let phy = self.phyaddr;
+        let (bmcr, bmcr_st) = mdio_read_status(base, phy, 0);
+        let (bmsr, bmsr_st) = mdio_read_status(base, phy, 1);
+        let (id1, id1_st) = mdio_read_status(base, phy, 2);
+        let (id2, id2_st) = mdio_read_status(base, phy, 3);
+        let mut found = Vec::new();
+        for a in 0u32..32 {
+            let (hi, st) = mdio_read_status(base, a, 2);
+            if st != MdioStatus::Ok || hi == 0 || hi == 0xffff {
+                continue;
+            }
+            let (lo, st2) = mdio_read_status(base, a, 3);
+            if st2 == MdioStatus::Ok && lo != 0xffff {
+                found.push(format!("a{}={:04x}{:04x}", a, hi, lo));
+            }
+        }
+        let scan = if found.is_empty() {
+            "scan=none".to_string()
+        } else {
+            format!("scan=[{}]", found.join(","))
+        };
+        format!(
+            "phyaddr={} BMCR={:04x}({}) BMSR={:04x}({}) PHYID={:04x}{:04x}({}/{}) {}",
+            phy,
+            bmcr,
+            bmcr_st.as_str(),
+            bmsr,
+            bmsr_st.as_str(),
+            id1,
+            id2,
+            id1_st.as_str(),
+            id2_st.as_str(),
+            scan
+        )
+    }
+
+    fn phy_init(&mut self) -> Result<(), &'static str> {
+        let base = self.base;
+        let mut phy = self.phyaddr;
+
+        // Before reset: dump + optionally adopt first responding PHY.
+        let diag0 = self.mdio_diag();
+        crate::breadcrumb::write(4, &diag0, None);
+        println!("AIOS genet: mdio pre-reset {diag0}");
+
+        let (id1, st1) = mdio_read_status(base, phy, 2);
+        if st1 != MdioStatus::Ok || id1 == 0 || id1 == 0xffff {
+            for a in 0u32..32 {
+                let (hi, st) = mdio_read_status(base, a, 2);
+                if st == MdioStatus::Ok && hi != 0 && hi != 0xffff {
+                    println!("AIOS genet: phyaddr {} dead, switching to {}", phy, a);
+                    phy = a;
+                    self.phyaddr = a;
+                    break;
+                }
+            }
+        }
 
         // reset
         mdio_write(base, phy, 0, 0x8000);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while mdio_read(base, phy, 0) & 0x8000 != 0 {
-            if Instant::now() > deadline {
-                return Err("phy reset timeout");
+        let mut reset_ok = false;
+        while Instant::now() <= deadline {
+            let (bmcr, st) = mdio_read_status(base, phy, 0);
+            if st == MdioStatus::Ok && (bmcr & 0x8000) == 0 {
+                reset_ok = true;
+                break;
+            }
+            // If MDIO is dead, don't spin claiming "reset done" on zeros.
+            if st != MdioStatus::Ok {
+                sleep_ms(10);
+                continue;
             }
             sleep_ms(10);
+        }
+        if !reset_ok {
+            let diag = self.mdio_diag();
+            crate::breadcrumb::write(4, "phy reset incomplete", Some(&diag));
+            println!("AIOS genet: phy reset incomplete {diag}");
+            // soft-continue: still try advertise / wait link
         }
 
         // advertising: 10/100 full+half + pause; 1000 full+half
@@ -369,63 +477,95 @@ impl Genet {
         // enable autoneg
         mdio_write(base, phy, 0, 0x1200);
 
-        // wait link up
+        // wait link up — do NOT hard-fail: type=notify would block init/login.
+        // Default 10 Mbps if still down (PC saw 10baseT partner); poll_phy later.
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut linked = false;
         loop {
-            let bmsr = mdio_read(base, phy, 1);
-            if bmsr & 0x0004 != 0 {
+            let (bmsr, st) = mdio_read_status(base, phy, 1);
+            if st == MdioStatus::Ok && bmsr & 0x0004 != 0 {
+                linked = true;
                 break;
             }
             if Instant::now() > deadline {
-                return Err("phy no link");
+                break;
             }
             sleep_ms(100);
         }
 
-        // read speed (standard genphy)
-        let lpagb = mdio_read(base, phy, 10);
-        let lpa = mdio_read(base, phy, 5);
-        let speed = if (lpagb & 0x0800) != 0 {
-            1000
-        } else if (lpagb & 0x0400) != 0 {
-            1000
-        } else if (lpa & 0x0100) != 0 {
-            100
-        } else if (lpa & 0x0080) != 0 {
-            100
-        } else if (lpa & 0x0040) != 0 {
-            10
-        } else if (lpa & 0x0020) != 0 {
-            10
+        let diag1 = self.mdio_diag();
+        crate::breadcrumb::write(
+            4,
+            &format!("phy post-init linked={} {}", linked as u8, diag1),
+            None,
+        );
+        println!("AIOS genet: mdio post-init linked={} {diag1}", linked as u8);
+
+        // Soft-fail default MUST match typical autoneg on Pi4↔PC (100), not 10:
+        // UMAC@10 + PHY@100 produces align_errors and zero good RX on the peer.
+        self.max_speed = if linked {
+            self.read_phy_speed()
         } else {
             100
         };
-        self.max_speed = speed;
         Ok(())
     }
 
-    pub fn tx_beacon(&mut self, counter: u64, msg: &str) -> Result<(), &'static str> {
+    fn read_phy_speed(&self) -> u32 {
         let base = self.base;
-        // build frame (min 60 bytes)
-        let mut frame = [0u8; 64];
-        frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        frame[6..12].copy_from_slice(&self.mac);
-        frame[12] = 0x88;
-        frame[13] = 0xB5;
-        let payload = format!("AIOS-BOOT n={} {}", counter, msg);
-        let pb = payload.as_bytes();
-        let n = pb.len().min(46);
-        frame[14..14 + n].copy_from_slice(&pb[..n]);
-        let frame_len: usize = 60;
+        let phy = self.phyaddr;
+        let lpagb = mdio_read(base, phy, 10);
+        let lpa = mdio_read(base, phy, 5);
+        if (lpagb & 0x0800) != 0 || (lpagb & 0x0400) != 0 {
+            1000
+        } else if (lpa & 0x0100) != 0 || (lpa & 0x0080) != 0 {
+            100
+        } else if (lpa & 0x0040) != 0 || (lpa & 0x0020) != 0 {
+            10
+        } else {
+            10
+        }
+    }
 
-        // write to tx buffer
+    /// Re-read BMSR; if link/speed changed, update UMAC. Call from beacon loop.
+    pub fn poll_phy_and_adjust(&mut self) -> bool {
+        let base = self.base;
+        let phy = self.phyaddr;
+        let (bmsr, st) = mdio_read_status(base, phy, 1);
+        if st != MdioStatus::Ok || bmsr & 0x0004 == 0 {
+            // MDIO blind / link down: keep MAC at 100 so RGMII matches common autoneg.
+            if self.max_speed != 100 {
+                self.max_speed = 100;
+                self.adjust_link();
+            }
+            return false;
+        }
+        let speed = self.read_phy_speed();
+        if speed != self.max_speed {
+            self.max_speed = speed;
+            self.adjust_link();
+        }
+        true
+    }
+
+    /// Transmit an Ethernet frame (pads to 60 bytes). Used by NetworkScheme.
+    pub fn tx_frame(&mut self, frame: &[u8]) -> Result<usize, &'static str> {
+        if frame.is_empty() {
+            return Err("empty frame");
+        }
+        let base = self.base;
+        let frame_len = frame.len().max(60).min(TX_BUF_LENGTH);
         let tx_virt = self.tx_buf.virt_addr();
         unsafe {
-            core::ptr::copy_nonoverlapping(frame.as_ptr(), tx_virt as *mut u8, frame_len);
+            core::ptr::write_bytes(tx_virt as *mut u8, 0, frame_len);
+            core::ptr::copy_nonoverlapping(
+                frame.as_ptr(),
+                tx_virt as *mut u8,
+                frame.len().min(frame_len),
+            );
         }
         let tx_phys = self.tx_buf.physical();
 
-        // fill descriptor
         let desc = base + GENET_TX_OFF + self.tx_slot * DMA_DESC_SIZE;
         wr32(desc, DMA_DESC_ADDRESS_LO, tx_phys as u32);
         wr32(desc, DMA_DESC_ADDRESS_HI, (tx_phys >> 32) as u32);
@@ -436,26 +576,37 @@ impl Genet {
             | DMA_EOP;
         wr32(desc, DMA_DESC_LENGTH_STATUS, len_stat);
 
-        // kick
         self.tx_slot = (self.tx_slot + 1) % TOTAL_DESCS;
-        self.tx_prod += 1;
+        self.tx_prod = self.tx_prod.wrapping_add(1);
         wr32(base, TDMA_RING_BASE + DMA_PROD_INDEX, self.tx_prod);
 
-        // wait for completion
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
             let cons = rd32(base, TDMA_RING_BASE + DMA_CONS_INDEX) & 0xFFFF;
             if cons == (self.tx_prod & 0xFFFF) {
-                break;
+                return Ok(frame.len());
             }
             if Instant::now() > deadline {
                 return Err("tx timeout");
             }
             thread::sleep(Duration::from_millis(1));
         }
-        Ok(())
     }
 
+    pub fn tx_beacon(&mut self, counter: u64, msg: &str) -> Result<(), &'static str> {
+        let mut frame = [0u8; 60];
+        frame[0..6].copy_from_slice(&[0xff; 6]);
+        frame[6..12].copy_from_slice(&self.mac);
+        frame[12] = 0x88;
+        frame[13] = 0xB5;
+        let payload = format!("AIOS-BOOT n={} {}", counter, msg);
+        let pb = payload.as_bytes();
+        let n = pb.len().min(46);
+        frame[14..14 + n].copy_from_slice(&pb[..n]);
+        self.tx_frame(&frame).map(|_| ())
+    }
+
+    /// Drain hardware RX descriptors into `rx_queue` (software backlog for NetworkScheme).
     pub fn poll_rx(&mut self) {
         let base = self.base;
         let prod = rd32(base, RDMA_RING_BASE + DMA_PROD_INDEX) & 0xFFFF;
@@ -465,17 +616,47 @@ impl Genet {
         while (self.c_index & 0xFFFF) != prod as usize {
             let slot = self.rx_index;
             let desc = base + GENET_RX_OFF + slot * DMA_DESC_SIZE;
-            let _addr = rd32(desc, DMA_DESC_ADDRESS_LO) as usize;
             let len_stat = rd32(desc, DMA_DESC_LENGTH_STATUS);
-            let _len = ((len_stat >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
-            // re-arm descriptor
+            let len = ((len_stat >> DMA_BUFLENGTH_SHIFT) & DMA_BUFLENGTH_MASK) as usize;
+            // Copy out before re-arming (RBUF_ALIGN_2B → 2-byte pad at start).
+            if len > 2 && len <= RX_BUF_LENGTH {
+                let payload_len = len - 2;
+                let mut pkt = vec![0u8; payload_len];
+                let src = self.rx_buf.virt_addr() as *const u8;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src.add(slot * RX_BUF_LENGTH + 2),
+                        pkt.as_mut_ptr(),
+                        payload_len,
+                    );
+                }
+                if self.rx_queue.len() < 64 {
+                    self.rx_queue.push(pkt);
+                }
+            }
             let buf_phys = self.rx_buf.physical() + slot * RX_BUF_LENGTH;
             wr32(desc, DMA_DESC_ADDRESS_LO, buf_phys as u32);
             wr32(desc, DMA_DESC_ADDRESS_HI, (buf_phys >> 32) as u32);
-            wr32(desc, DMA_DESC_LENGTH_STATUS, (RX_BUF_LENGTH as u32) << DMA_BUFLENGTH_SHIFT | DMA_OWN);
+            wr32(
+                desc,
+                DMA_DESC_LENGTH_STATUS,
+                (RX_BUF_LENGTH as u32) << DMA_BUFLENGTH_SHIFT | DMA_OWN,
+            );
             self.c_index = (self.c_index + 1) & 0xFFFF;
             wr32(base, RDMA_RING_BASE + DMA_CONS_INDEX, self.c_index as u32);
             self.rx_index = (self.rx_index + 1) % TOTAL_DESCS;
+        }
+    }
+
+    pub fn rx_pending(&self) -> usize {
+        self.rx_queue.len()
+    }
+
+    pub fn pop_rx(&mut self) -> Option<Vec<u8>> {
+        if self.rx_queue.is_empty() {
+            None
+        } else {
+            Some(self.rx_queue.remove(0))
         }
     }
 
@@ -488,28 +669,53 @@ impl Genet {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MdioStatus {
+    Ok,
+    Timeout,
+    Fail,
+}
+
+impl MdioStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            MdioStatus::Ok => "ok",
+            MdioStatus::Timeout => "timeout",
+            MdioStatus::Fail => "fail",
+        }
+    }
+}
+
 // MDIO helpers (free functions using base)
-fn mdio_read(base: usize, phy: u32, reg: u32) -> u16 {
-    wr32(base, MDIO_CMD, MDIO_RD | (phy << MDIO_PMD_SHIFT) | (reg << MDIO_REG_SHIFT));
-    wr32(base, MDIO_CMD, rd32(base, MDIO_CMD) | MDIO_START_BUSY);
-    let deadline = Instant::now() + Duration::from_millis(20);
+fn mdio_read_status(base: usize, phy: u32, reg: u32) -> (u16, MdioStatus) {
+    // U-Boot: write cmd, then rewrite with START_BUSY set in one value.
+    let cmd = MDIO_RD | (phy << MDIO_PMD_SHIFT) | (reg << MDIO_REG_SHIFT);
+    wr32(base, MDIO_CMD, cmd);
+    wr32(base, MDIO_CMD, cmd | MDIO_START_BUSY);
+    let deadline = Instant::now() + Duration::from_millis(100);
     while rd32(base, MDIO_CMD) & MDIO_START_BUSY != 0 {
         if Instant::now() > deadline {
-            return 0;
+            return (0, MdioStatus::Timeout);
         }
         thread::sleep(Duration::from_micros(100));
     }
     let val = rd32(base, MDIO_CMD);
     if val & MDIO_READ_FAIL != 0 {
-        return 0;
+        return (0, MdioStatus::Fail);
     }
-    (val & 0xFFFF) as u16
+    ((val & 0xFFFF) as u16, MdioStatus::Ok)
+}
+
+fn mdio_read(base: usize, phy: u32, reg: u32) -> u16 {
+    mdio_read_status(base, phy, reg).0
 }
 
 fn mdio_write(base: usize, phy: u32, reg: u32, val: u16) {
-    wr32(base, MDIO_CMD, MDIO_WR | (phy << MDIO_PMD_SHIFT) | (reg << MDIO_REG_SHIFT) | (val as u32 & 0xFFFF));
-    wr32(base, MDIO_CMD, rd32(base, MDIO_CMD) | MDIO_START_BUSY);
-    let deadline = Instant::now() + Duration::from_millis(20);
+    let cmd =
+        MDIO_WR | (phy << MDIO_PMD_SHIFT) | (reg << MDIO_REG_SHIFT) | (val as u32 & 0xFFFF);
+    wr32(base, MDIO_CMD, cmd);
+    wr32(base, MDIO_CMD, cmd | MDIO_START_BUSY);
+    let deadline = Instant::now() + Duration::from_millis(100);
     while rd32(base, MDIO_CMD) & MDIO_START_BUSY != 0 {
         if Instant::now() > deadline {
             break;

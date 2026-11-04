@@ -35,7 +35,11 @@ pub(crate) unsafe fn wait_msec(mut n: usize) {
     asm!("mrs {0}, cntfrq_el0", out(reg) f);
     asm!("mrs {0}, cntpct_el0", out(reg) t);
 
-    t += ((f / 1000) * n) / 1000;
+    // AIOS: f is the counter frequency in ticks/second, so one millisecond is
+    // f / 1000 ticks. The previous expression divided by 1000 twice and every
+    // timeout in this driver was 1000x shorter than requested (2 ms instead of
+    // 2 s), which made card transfers time out on real hardware.
+    t += (f * n) / 1000;
 
     loop {
         asm!("mrs {0}, cntpct_el0", out(reg) r);
