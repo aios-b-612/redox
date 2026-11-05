@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use common;
 use daemon::Daemon;
+#[cfg(feature = "network-scheme")]
 use driver_network::NetworkScheme;
 use fdt::Fdt;
 use genet::Genet;
@@ -61,10 +62,12 @@ fn mark(led: &Option<led::Led>, n: u32, path: &str, msg: &str) {
 }
 
 /// NetworkAdapter implementation for BCM2711 GENET.
+#[cfg(feature = "network-scheme")]
 struct GenetAdapter {
     genet: Genet,
 }
 
+#[cfg(feature = "network-scheme")]
 impl driver_network::NetworkAdapter for GenetAdapter {
     fn mac_address(&mut self) -> [u8; 6] {
         self.genet.mac()
@@ -353,13 +356,24 @@ fn daemon(daemon: Daemon) -> ! {
 
     mark(&led, 6, "/var/lib/ai/net-06", "sobreviveu ao GENET — beacon-only M1");
 
-    // Ready before any scheme/TX. NetworkScheme::new hung the board again on
-    // 2026-11-04 (M2). Keep beacon-only unless feature `network-scheme` is on
-    // AND scripts/pi4-regression-guard.sh + HW login/beacon pass.
-    let _ = daemon.ready();
-    mark(&led, 7, "/var/lib/ai/net-07", "daemon.ready — a transmitir AIOS-BOOT");
+    // `Daemon::ready` consumes `self`. NetworkScheme::new calls it after the
+    // scheme is registered, so the M2 path must hand `daemon` over intact.
+    // The unit is oneshot_async: init does not wait if register stalls.
+    #[cfg(feature = "network-scheme")]
+    {
+        run_with_scheme(genet, daemon, led, mac);
+    }
+    #[cfg(not(feature = "network-scheme"))]
+    {
+        let _ = daemon.ready();
+        mark(&led, 7, "/var/lib/ai/net-07", "daemon.ready — a transmitir AIOS-BOOT");
+        run_beacon_only(genet, led, mac);
+    }
+}
 
-    let mut genet = genet;
+/// M1 default: beacons only. Login and TX stay valid without NetworkScheme.
+#[cfg(not(feature = "network-scheme"))]
+fn run_beacon_only(mut genet: Genet, led: Option<led::Led>, mac: [u8; 6]) -> ! {
     let mut counter: u64 = 0;
     loop {
         println!("AIOS genet: loop n={counter} pre-phy");
@@ -396,6 +410,50 @@ fn daemon(daemon: Daemon) -> ! {
             l.success();
         }
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// M2 experiment (`--features network-scheme`). Boot does not wait on this
+/// process (`oneshot_async` + `ready()` already called).
+#[cfg(feature = "network-scheme")]
+fn run_with_scheme(genet: Genet, daemon: Daemon, led: Option<led::Led>, mac: [u8; 6]) -> ! {
+    mark(
+        &led,
+        7,
+        "/var/lib/ai/net-07b",
+        "a registar network.genet",
+    );
+    let adapter = GenetAdapter { genet };
+    let mut scheme = NetworkScheme::new(move || adapter, daemon, "network.genet".to_string());
+    mark(&led, 7, "/var/lib/ai/net-07c", "network.genet registered");
+
+    let mut counter: u64 = 0;
+    let mut last_beacon = std::time::Instant::now();
+    let _ = scheme.tick();
+    loop {
+        let _ = scheme.tick();
+        if last_beacon.elapsed() >= Duration::from_secs(2) {
+            last_beacon = std::time::Instant::now();
+            let linked = scheme.adapter_mut().genet.poll_phy_and_adjust();
+            let speed = scheme.adapter().genet.max_speed();
+            counter += 1;
+            println!(
+                "AIOS genet: M2 n={counter} link={} speed={}",
+                linked as u8, speed
+            );
+            let msg = format!(
+                "AIOS-BOOT n={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} speed={} link={}",
+                counter, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], speed, linked as u8
+            );
+            match scheme.adapter_mut().genet.tx_beacon(counter, &msg) {
+                Ok(()) => println!("AIOS genet: beacon {counter} ok"),
+                Err(e) => println!("AIOS genet: beacon {counter} err: {e}"),
+            }
+            if let Some(l) = &led {
+                l.success();
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 

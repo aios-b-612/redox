@@ -16,9 +16,12 @@ libredox.workspace = true
 redox_syscall = { workspace = true, features = ["std"] }
 redox_event.workspace = true
 
-[lints]
-workspace = true
 [features]
 default = []
-# EXPERIMENTAL: hangou no Pi 4 (2026-11-04). Só com HW + guard.
+# Experimental. Off unless `--features network-scheme`. Hung the Pi on 2026-11-04
+# when init waited on type=notify; the unit is now oneshot_async and ready()
+# runs before NetworkScheme::new.
 network-scheme = []
+
+[lints]
+workspace = true
