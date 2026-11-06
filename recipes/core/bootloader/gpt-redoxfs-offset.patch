@@ -1,11 +1,121 @@
+diff --git a/src/main.rs b/src/main.rs
+index 9fb9e09..8850166 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -459,12 +459,20 @@ fn elf_entry(data: &[u8]) -> (u64, bool) {
+     }
+ }
+ 
++fn boot_stage(msg: &str) {
++    #[cfg(target_os = "uefi")]
++    crate::os::stage(msg);
++    #[cfg(not(target_os = "uefi"))]
++    let _ = msg;
++}
++
+ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     println!(
+         "Redox OS Bootloader {} on {}",
+         env!("CARGO_PKG_VERSION"),
+         os.name()
+     );
++    boot_stage("boot-start");
+ 
+     let hwdesc = os.hwdesc();
+     println!("Hardware descriptor: {:x?}", hwdesc);
+@@ -474,7 +482,9 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+         OsHwDesc::NotFound => (0, 0),
+     };
+ 
++    boot_stage("fs-open");
+     let (mut fs, password_opt) = redoxfs(os);
++    boot_stage("fs-ok");
+ 
+     print!("RedoxFS ");
+     for i in 0..fs.header.uuid().len() {
+@@ -611,14 +621,18 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     // Select the final video modes before taking the UEFI memory-map snapshot
+     // used to build the AArch64 page tables. SetMode may change the framebuffer
+     // address and its cacheability descriptors.
++    boot_stage("pre-video");
+     for (output_i, mode_opt) in mode_opts.iter_mut().enumerate() {
+         if let Some(mode) = mode_opt {
+             os.set_video_mode(output_i, mode);
+         }
+     }
++    boot_stage("post-video");
+ 
++    boot_stage("pre-paging");
+     let page_phys = unsafe { paging_create(os, kernel.as_ptr() as u64, kernel.len() as u64) }
+         .expect("Failed to set up paging");
++    boot_stage("post-paging");
+ 
+     {
+         let mut w = SliceWriter {
 diff --git a/src/os/uefi/device.rs b/src/os/uefi/device.rs
-index e4953da..79eabc9 100644
+index e4953da..2a1b979 100644
 --- a/src/os/uefi/device.rs
 +++ b/src/os/uefi/device.rs
-@@ -94,6 +94,91 @@ fn esp_live_image(esp_handle: Handle, esp_device_path: &DevicePath) -> Option<Ve
+@@ -94,6 +94,151 @@ fn esp_live_image(esp_handle: Handle, esp_device_path: &DevicePath) -> Option<Ve
      Some(buffer)
  }
  
++/// Last boot stage, overwritten on the ESP. A hang leaves the last line in
++/// `\aios-stage.txt` because the bootloader never writes RedoxFS.
++pub fn stage(msg: &str) {
++    println!("AIOS: stage {}", msg);
++    let esp_handle = match LoadedImage::handle_protocol(std::handle()) {
++        Ok(loaded) => loaded.0.DeviceHandle,
++        Err(_) => return,
++    };
++    let mut esp_fs = match FileSystem::handle_protocol(esp_handle) {
++        Ok(fs) => fs,
++        Err(_) => return,
++    };
++    let mut root = match esp_fs.root() {
++        Ok(root) => root,
++        Err(_) => return,
++    };
++    let name = [
++        b'\\' as u16,
++        b'a' as u16,
++        b'i' as u16,
++        b'o' as u16,
++        b's' as u16,
++        b'-' as u16,
++        b's' as u16,
++        b't' as u16,
++        b'a' as u16,
++        b'g' as u16,
++        b'e' as u16,
++        b'.' as u16,
++        b't' as u16,
++        b'x' as u16,
++        b't' as u16,
++        0,
++    ];
++    let mut interface = core::ptr::null_mut();
++    let status = (root.0.0.Open)(
++        root.0.0,
++        &mut interface,
++        name.as_ptr(),
++        uefi::fs::FILE_MODE_READ | uefi::fs::FILE_MODE_WRITE | uefi::fs::FILE_MODE_CREATE,
++        0,
++    );
++    if !status.is_success() || interface.is_null() {
++        return;
++    }
++    let mut file = uefi_std::fs::File(unsafe { &mut *interface });
++    let _ = (file.0.SetPosition)(file.0, 0);
++    let mut line = [b' '; 32];
++    let bytes = msg.as_bytes();
++    let n = bytes.len().min(31);
++    line[..n].copy_from_slice(&bytes[..n]);
++    line[31] = b'\n';
++    let _ = file.write(&line);
++    let _ = (file.0.Flush)(file.0);
++}
++
 +/// Byte offset of the REDOX partition when the firmware only publishes the
 +/// whole disk. A fixed 2 MiB misses the Pi image: the ESP is 128 MiB and
 +/// RedoxFS starts at LBA 264192. Without the real start, open fails and the
@@ -30,6 +140,7 @@ index e4953da..79eabc9 100644
 +        }
 +        slice::from_raw_parts_mut(ptr, block_size)
 +    };
++    stage("gpt-header");
 +    let status = unsafe {
 +        (disk.0.ReadBlocks)(
 +            disk.0,
@@ -40,61 +151,64 @@ index e4953da..79eabc9 100644
 +        )
 +    };
 +    if !status.is_success() || header.len() < 92 || &header[..8] != b"EFI PART" {
++        stage("gpt-header-fail");
 +        return FALLBACK;
 +    }
 +
 +    let entry_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
 +    let nentries = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
 +    let entsz = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
-+    if entsz < 48 || nentries == 0 || nentries > 128 {
++    if entsz < 48 || nentries == 0 || nentries > 128 || entsz > block_size {
++        stage("gpt-header-bad");
 +        return FALLBACK;
 +    }
 +
-+    let entries_bytes = nentries * entsz;
-+    let rounded = entries_bytes.div_ceil(block_size) * block_size;
-+    let entries = unsafe {
-+        let ptr = super::alloc_zeroed_page_aligned(rounded);
-+        if ptr.is_null() {
++    // One media block per ReadBlocks. A 16 KiB read of the whole entry array
++    // can fail on the Pi firmware and fall back to the 2 MiB offset.
++    stage("gpt-scan");
++    let nblocks = (nentries * entsz).div_ceil(block_size);
++    for b in 0..nblocks {
++        let status = unsafe {
++            (disk.0.ReadBlocks)(
++                disk.0,
++                disk.0.Media.MediaId,
++                entry_lba + b as u64,
++                block_size,
++                header.as_mut_ptr(),
++            )
++        };
++        if !status.is_success() {
++            stage("gpt-read-fail");
 +            return FALLBACK;
 +        }
-+        slice::from_raw_parts_mut(ptr, rounded)
-+    };
-+    let status = unsafe {
-+        (disk.0.ReadBlocks)(
-+            disk.0,
-+            disk.0.Media.MediaId,
-+            entry_lba,
-+            rounded,
-+            entries.as_mut_ptr(),
-+        )
-+    };
-+    if !status.is_success() {
-+        return FALLBACK;
-+    }
-+
-+    for i in 0..nentries {
-+        let start = i * entsz;
-+        if start + 48 > entries.len() {
-+            break;
++        let mut off = 0;
++        while off + entsz <= block_size {
++            let index = (b * block_size + off) / entsz;
++            if index >= nentries {
++                break;
++            }
++            let e = &header[off..off + 48];
++            off += entsz;
++            if e[..16] != REDOX_TYPE {
++                continue;
++            }
++            let start_lba = u64::from_le_bytes(e[32..40].try_into().unwrap());
++            let offset = start_lba.saturating_mul(block_size as u64);
++            println!("AIOS: RedoxFS GPT LBA {} offset {}", start_lba, offset);
++            stage("gpt-ok");
++            return offset;
 +        }
-+        let e = &entries[start..start + 48];
-+        if e[..16] != REDOX_TYPE {
-+            continue;
-+        }
-+        let start_lba = u64::from_le_bytes(e[32..40].try_into().unwrap());
-+        let offset = start_lba.saturating_mul(block_size as u64);
-+        println!("AIOS: RedoxFS GPT LBA {} offset {}", start_lba, offset);
-+        return offset;
 +    }
 +
 +    println!("AIOS: no REDOX GPT entry, fallback {} bytes", FALLBACK);
++    stage("gpt-missing");
 +    FALLBACK
 +}
 +
  pub struct DiskDevice {
      pub handle: Handle,
      pub disk: DiskOrFileEfi,
-@@ -154,7 +239,7 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+@@ -154,7 +299,7 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
      };
      let mut devices = Vec::with_capacity(handles.len());
      for handle in handles {
@@ -103,7 +217,7 @@ index e4953da..79eabc9 100644
              Ok(ok) => ok,
              Err(err) => {
                  log::warn!(
-@@ -182,14 +267,14 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+@@ -182,14 +327,14 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
              }
          };
  
@@ -124,3 +238,43 @@ index e4953da..79eabc9 100644
              disk: DiskOrFileEfi::Disk(disk),
              device_path,
              file_path: None,
+diff --git a/src/os/uefi/mod.rs b/src/os/uefi/mod.rs
+index 04ad511..d88c8e2 100644
+--- a/src/os/uefi/mod.rs
++++ b/src/os/uefi/mod.rs
+@@ -20,6 +20,10 @@ use self::{
+     video_mode::VideoModeIter,
+ };
+ 
++pub fn stage(msg: &str) {
++    device::stage(msg);
++}
++
+ mod acpi;
+ mod arch;
+ mod device;
+@@ -259,15 +263,18 @@ impl Os for OsEfi {
+     }
+ 
+     fn set_video_mode(&self, output_i: usize, mode: &mut OsVideoMode) {
+-        //TODO: return error?
++        // Keep the mode the Pi firmware already programmed. SetMode on this
++        // GOP has hung HDMI after the kernel and initfs were loaded.
+         let mut outputs = self.outputs.borrow_mut();
+         let (output, _efi_edid_opt) = &mut outputs[output_i];
+-        status_to_result((output.0.SetMode)(output.0, mode.id)).unwrap();
+-
+-        // Update with actual mode information
+-        mode.width = output.0.Mode.Info.HorizontalResolution;
+-        mode.height = output.0.Mode.Info.VerticalResolution;
++        let info = output.0.Mode.Info;
++        mode.width = info.HorizontalResolution;
++        mode.height = info.VerticalResolution;
+         mode.base = output.0.Mode.FrameBufferBase as u64;
++        println!(
++            "AIOS: GOP mode atual {}x{} stride {}",
++            mode.width, mode.height, info.PixelsPerScanLine
++        );
+     }
+ 
+     fn best_resolution(&self, output_i: usize) -> Option<(u32, u32)> {
