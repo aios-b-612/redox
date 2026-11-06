@@ -1,0 +1,126 @@
+diff --git a/src/os/uefi/device.rs b/src/os/uefi/device.rs
+index e4953da..79eabc9 100644
+--- a/src/os/uefi/device.rs
++++ b/src/os/uefi/device.rs
+@@ -94,6 +94,91 @@ fn esp_live_image(esp_handle: Handle, esp_device_path: &DevicePath) -> Option<Ve
+     Some(buffer)
+ }
+ 
++/// Byte offset of the REDOX partition when the firmware only publishes the
++/// whole disk. A fixed 2 MiB misses the Pi image: the ESP is 128 MiB and
++/// RedoxFS starts at LBA 264192. Without the real start, open fails and the
++/// screen stops at "No RedoxFS partitions found" before the root is mounted.
++fn redoxfs_offset_from_gpt(disk: &mut DiskEfi) -> u64 {
++    const FALLBACK: u64 = 2 * crate::MIBI as u64;
++    // On-disk mixed-endian type GUID of the REDOX GPT entry.
++    const REDOX_TYPE: [u8; 16] = [
++        0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d,
++        0xe4,
++    ];
++
++    let block_size = disk.0.Media.BlockSize as usize;
++    if block_size < 512 || block_size > 4096 || !block_size.is_power_of_two() {
++        return FALLBACK;
++    }
++
++    let header = unsafe {
++        let ptr = super::alloc_zeroed_page_aligned(block_size);
++        if ptr.is_null() {
++            return FALLBACK;
++        }
++        slice::from_raw_parts_mut(ptr, block_size)
++    };
++    let status = unsafe {
++        (disk.0.ReadBlocks)(
++            disk.0,
++            disk.0.Media.MediaId,
++            1,
++            block_size,
++            header.as_mut_ptr(),
++        )
++    };
++    if !status.is_success() || header.len() < 92 || &header[..8] != b"EFI PART" {
++        return FALLBACK;
++    }
++
++    let entry_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
++    let nentries = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
++    let entsz = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
++    if entsz < 48 || nentries == 0 || nentries > 128 {
++        return FALLBACK;
++    }
++
++    let entries_bytes = nentries * entsz;
++    let rounded = entries_bytes.div_ceil(block_size) * block_size;
++    let entries = unsafe {
++        let ptr = super::alloc_zeroed_page_aligned(rounded);
++        if ptr.is_null() {
++            return FALLBACK;
++        }
++        slice::from_raw_parts_mut(ptr, rounded)
++    };
++    let status = unsafe {
++        (disk.0.ReadBlocks)(
++            disk.0,
++            disk.0.Media.MediaId,
++            entry_lba,
++            rounded,
++            entries.as_mut_ptr(),
++        )
++    };
++    if !status.is_success() {
++        return FALLBACK;
++    }
++
++    for i in 0..nentries {
++        let start = i * entsz;
++        if start + 48 > entries.len() {
++            break;
++        }
++        let e = &entries[start..start + 48];
++        if e[..16] != REDOX_TYPE {
++            continue;
++        }
++        let start_lba = u64::from_le_bytes(e[32..40].try_into().unwrap());
++        let offset = start_lba.saturating_mul(block_size as u64);
++        println!("AIOS: RedoxFS GPT LBA {} offset {}", start_lba, offset);
++        return offset;
++    }
++
++    println!("AIOS: no REDOX GPT entry, fallback {} bytes", FALLBACK);
++    FALLBACK
++}
++
+ pub struct DiskDevice {
+     pub handle: Handle,
+     pub disk: DiskOrFileEfi,
+@@ -154,7 +239,7 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+     };
+     let mut devices = Vec::with_capacity(handles.len());
+     for handle in handles {
+-        let disk = match DiskEfi::handle_protocol(handle) {
++        let mut disk = match DiskEfi::handle_protocol(handle) {
+             Ok(ok) => ok,
+             Err(err) => {
+                 log::warn!(
+@@ -182,14 +267,14 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+             }
+         };
+ 
++        let partition_offset = if disk.0.Media.LogicalPartition {
++            0
++        } else {
++            redoxfs_offset_from_gpt(&mut disk)
++        };
+         devices.push(DiskDevice {
+             handle,
+-            partition_offset: if disk.0.Media.LogicalPartition {
+-                0
+-            } else {
+-                //TODO: get block from partition table
+-                2 * crate::MIBI as u64
+-            },
++            partition_offset,
+             disk: DiskOrFileEfi::Disk(disk),
+             device_path,
+             file_path: None,

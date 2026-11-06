@@ -1,5 +1,10 @@
 [source]
 git = "https://gitlab.redox-os.org/redox-os/bootloader.git"
+# Auto-boot headless. Sem este rev o cookbook usa o EFI em cache e o menu
+# espera teclado. O patch lê o início real da partição REDOX na GPT: o
+# fallback de 2 MiB não encontra o RedoxFS desta imagem (ESP de 128 MiB).
+rev = "67262f3253ba6af82a0281df43fd210dfdcc23c6"
+patches = ["gpt-redoxfs-offset.patch"]
 
 [build]
 template = "custom"
